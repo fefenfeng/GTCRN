@@ -9,6 +9,7 @@ from joblib import Parallel, delayed
 import soundfile as sf
 from torch.utils.tensorboard import SummaryWriter
 from distributed_utils import reduce_value
+from pesq.cypesq import NoUtterancesError
 
 
 class Trainer:
@@ -17,8 +18,12 @@ class Trainer:
         self.config = config
         self.model = model
         self.optimizer = optimizer
-        self.scheduler = torch.optim.lr_scheduler.MultiStepLR(
-            self.optimizer, [80, 120, 150, 170, 180, 190, 200], gamma=0.5, verbose=False)
+
+        # self.scheduler = torch.optim.lr_scheduler.MultiStepLR(
+        #     self.optimizer, [80, 120, 150, 170, 180, 190, 200], gamma=0.5, verbose=False)
+
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=5)
+
         self.loss_func = loss_func
 
         self.train_dataloader = train_dataloader
@@ -35,6 +40,7 @@ class Trainer:
         self.save_checkpoint_interval = self.trainer_config['save_checkpoint_interval']
         self.clip_grad_norm_value = self.trainer_config['clip_grad_norm_value']
         self.resume = self.trainer_config['resume']
+        self.listener_sr = config['listener']['listener_sr']
 
         if not self.resume:
             self.exp_path = self.trainer_config['exp_path'] + '_' + datetime.now().strftime("%Y-%m-%d-%Hh%Mm")
@@ -69,7 +75,6 @@ class Trainer:
         self.sr = config['listener']['listener_sr']
 
         self.loss_func = self.loss_func.to(self.device)
-
 
     def _set_train_mode(self):
         self.model.train()
@@ -110,8 +115,8 @@ class Trainer:
 
         for step, (mixture, target) in enumerate(train_bar, 1):
             mixture = mixture.to(self.device)
-            target = target.to(self.device)  
-            
+            target = target.to(self.device)
+
             esti_tagt = self.model(mixture)
 
             loss = self.loss_func(esti_tagt, target)
@@ -122,7 +127,7 @@ class Trainer:
             train_bar.desc = '   train[{}/{}][{}]'.format(
                 epoch, self.epochs + self.start_epoch-1, datetime.now().strftime("%Y-%m-%d-%H:%M"))
 
-            self.train_bar.postfix = 'train_loss={:.2f}'.format(total_loss / step)
+            train_bar.postfix = 'train_loss={:.2f}'.format(total_loss / step)
 
             self.optimizer.zero_grad()
             loss.backward()
@@ -157,9 +162,19 @@ class Trainer:
             enhanced = torch.istft(esti_tagt[..., 0] + 1j*esti_tagt[..., 1], **self.config['FFT'], window=torch.hann_window(self.config['FFT']['win_length']).pow(0.5).to(self.device)).detach().cpu().numpy()
             clean = torch.istft(target[..., 0] + 1j*target[..., 1], **self.config['FFT'], window=torch.hann_window(self.config['FFT']['win_length']).pow(0.5).to(self.device)).cpu().numpy()
 
-            pesq_score_batch = Parallel(n_jobs=-1)(
-                delayed(pesq)(16000, c, e, 'wb') for c, e in zip(clean, enhanced))
+            # pesq_score_batch = Parallel(n_jobs=-1)(
+            #     delayed(pesq)(16000, c, e, 'wb') for c, e in zip(clean, enhanced))
+
+            batch_size = clean.shape[0]
+            pesq_score_batch = torch.zeros((batch_size, ))
+            for i in range(batch_size):
+                try:
+                    pesq_score_batch[i] = torch.tensor(pesq(self.listener_sr, clean[i], enhanced[i], 'wb'))
+                except NoUtterancesError:
+                    pesq_score_batch[i] = 0
+
             pesq_score = torch.tensor(pesq_score_batch, device=self.device).mean()
+
             if self.world_size > 1:
                 pesq_score = reduce_value(pesq_score)
             total_pesq_score += pesq_score
@@ -167,10 +182,10 @@ class Trainer:
             if self.rank == 0 and step <= 3:
                 sf.write(os.path.join(self.sample_path,
                                     '{}_enhanced_epoch{}_pesq={:.3f}.wav'.format(step, epoch, pesq_score_batch[0])),
-                                    enhanced[0], 16000)
+                                    enhanced[0], self.listener_sr)
                 sf.write(os.path.join(self.sample_path,
                                     '{}_clean.wav'.format(step)),
-                                    clean[0], 16000)
+                                    clean[0], self.listener_sr)
                 
             validation_bar.desc = 'validate[{}/{}][{}]'.format(
                 epoch, self.epochs + self.start_epoch-1, datetime.now().strftime("%Y-%m-%d-%H:%M"))
@@ -189,7 +204,6 @@ class Trainer:
 
         return total_loss / step, total_pesq_score / step
 
-
     def train(self):
         if self.resume:
             self._resume_checkpoint()
@@ -204,7 +218,7 @@ class Trainer:
             self._set_eval_mode()
             valid_loss, score = self._validation_epoch(epoch)
 
-            self.scheduler.step()
+            self.scheduler.step(valid_loss)
 
             if (self.rank == 0) and (epoch % self.save_checkpoint_interval == 0):
                 self._save_checkpoint(epoch, score)
