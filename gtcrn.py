@@ -319,6 +319,13 @@ class GTCRN(nn.Module):
 
         m = self.erb.bs(m_feat)
 
+        # # debug一下mask的实部和虚部
+        # m_real = m[:, 0:1, :, :]
+        # m_imag = m[:, 1:2, :, :]
+        # # 保存实部和虚部到文件
+        # torch.save(m_real, '/home/yuhengfeng/Experiments/GTCRN/mask_log/m_real.pt')
+        # torch.save(m_imag, '/home/yuhengfeng/Experiments/GTCRN/mask_log/m_imag.pt')
+
         spec_enh = self.mask(m, spec_ref.permute(0, 3, 2, 1))  # (B,2,T,F)
         spec_enh = spec_enh.permute(0, 3, 2, 1)  # (B,F,T,2)
 
